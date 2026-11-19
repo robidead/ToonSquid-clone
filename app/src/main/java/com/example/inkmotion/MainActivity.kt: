@@ -1,0 +1,505 @@
+package com.example.inkmotion
+
+import android.content.ContentValues
+import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.media.MediaPlayer
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.OutputStream
+import java.nio.ByteBuffer
+import java.util.ArrayDeque
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
+
+enum class StudioTool {
+    BRUSH, ERASER, FILL, LINE, RECT, OVAL, BONE_RIG, TRANSFORM, CAMERA
+}
+
+enum class LayerBlendPreset(val label: String, val mode: BlendMode) {
+    NORMAL("Norm", BlendMode.SrcOver),
+    MULTIPLY("Mult", BlendMode.Multiply),
+    SCREEN("Scr", BlendMode.Screen),
+    OVERLAY("Ovr", BlendMode.Overlay),
+    DARKEN("Dark", BlendMode.Darken),
+    LIGHTEN("Light", BlendMode.Lighten)
+}
+
+data class CameraKey(
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val zoom: Float = 1f
+)
+
+data class LayerTransformKey(
+    val tx: Float = 0f,
+    val ty: Float = 0f,
+    val scale: Float = 1f,
+    val rotationDeg: Float = 0f
+)
+
+data class StrokeItem(
+    val points: List<Offset>,
+    val color: Color,
+    val width: Float,
+    val isEraser: Boolean = false,
+    val shapeType: StudioTool = StudioTool.BRUSH,
+    val boundBoneId: Int? = null,
+    val localBonePoints: List<Offset> = emptyList()
+)
+
+data class FillPatch(
+    val bitmap: Bitmap,
+    val offsetX: Float = 0f,
+    val offsetY: Float = 0f
+)
+
+data class LayerItem(
+    val id: Int,
+    val name: String,
+    var visible: Boolean = true,
+    var alpha: Float = 1f,
+    var blendPreset: LayerBlendPreset = LayerBlendPreset.NORMAL,
+    var bindToSelectedBone: Boolean = false,
+    val strokes: SnapshotStateList<StrokeItem> = mutableStateListOf(),
+    val fills: SnapshotStateList<FillPatch> = mutableStateListOf(),
+    val transformKeys: SnapshotStateMap<Int, LayerTransformKey> = mutableStateMapOf()
+)
+
+data class BoneDef(
+    val id: Int,
+    val name: String,
+    val parentId: Int? = null,
+    val length: Float = 110f,
+    val baseAngleDeg: Float = -90f
+)
+
+data class AnimFrame(
+    val number: Int,
+    val layers: SnapshotStateList<LayerItem> = mutableStateListOf(
+        LayerItem(id = 1, name = "Слой 1")
+    ),
+    val boneAngleOffsets: SnapshotStateMap<Int, Float> = mutableStateMapOf()
+)
+
+data class SolvedBoneNode(
+    val bone: BoneDef,
+    val start: Offset,
+    val end: Offset,
+    val worldAngleDeg: Float
+)
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme(
+                colorScheme = darkColorScheme(
+                    primary = Color(0xFF4EA8DE),
+                    background = Color(0xFF121417),
+                    surface = Color(0xFF1C1F26)
+                )
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    InkMotionFullStudio()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun InkMotionFullStudio() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val bones = remember {
+        mutableStateListOf(
+            BoneDef(1, "Торс", null, 115f, -90f),
+            BoneDef(2, "Голова", 1, 65f, -90f),
+            BoneDef(3, "Рука L", 1, 95f, -150f),
+            BoneDef(4, "Рука R", 1, 95f, -30f)
+        )
+    }
+    var selectedBoneId by remember { mutableIntStateOf(1) }
+    var skeletonOrigin by remember { mutableStateOf(Offset(540f, 820f)) }
+    val copiedPoseBuffer = remember { mutableStateMapOf<Int, Float>() }
+
+    val frames = remember { mutableStateListOf(AnimFrame(1)) }
+    val cameraKeys = remember { mutableStateMapOf<Int, CameraKey>() }
+    var currentFrameIdx by remember { mutableIntStateOf(0) }
+    var activeLayerIdx by remember { mutableIntStateOf(0) }
+
+    var tool by remember { mutableStateOf(StudioTool.BRUSH) }
+    var selectedColor by remember { mutableStateOf(Color(0xFF111111)) }
+    var strokeWidth by remember { mutableFloatStateOf(10f) }
+    var fps by remember { mutableIntStateOf(12) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var isExporting by remember { mutableStateOf(false) }
+    var onionSkin by remember { mutableStateOf(true) }
+    var showBones by remember { mutableStateOf(true) }
+    var showCameraGuide by remember { mutableStateOf(true) }
+    var showGrid by remember { mutableStateOf(false) }
+    var tweenEnabled by remember { mutableStateOf(true) }
+    var showLayersDrawer by remember { mutableStateOf(false) }
+
+    var audioUri by remember { mutableStateOf<Uri?>(null) }
+    var audioName by remember { mutableStateOf<String?>(null) }
+    var audioStartFrame by remember { mutableIntStateOf(0) }
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+
+    var livePoints by remember { mutableStateOf<List<Offset>>(emptyList()) }
+    var canvasSizePx by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+
+    val audioPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            mediaPlayer?.release()
+            mediaPlayer = null
+            audioUri = uri
+            audioName = uri.lastPathSegment ?: "Аудио"
+            audioStartFrame = currentFrameIdx
+            try {
+                val mp = MediaPlayer().apply {
+                    setDataSource(context, uri)
+                    prepare()
+                }
+                mediaPlayer = mp
+                Toast.makeText(context, "Аудио загружено", Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
+                Toast.makeText(context, "Не удалось прочитать аудио", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val projectLoader = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                val jsonText = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                if (!jsonText.isNullOrBlank()) {
+                    loadProjectFromJson(
+                        jsonText = jsonText,
+                        bones = bones,
+                        frames = frames,
+                        cameraKeys = cameraKeys,
+                        onOriginLoaded = { skeletonOrigin = it },
+                        onFpsLoaded = { fps = it }
+                    )
+                    currentFrameIdx = 0
+                    activeLayerIdx = 0
+                    Toast.makeText(context, "Проект загружен", Toast.LENGTH_SHORT).show()
+                }
+            } catch (_: Exception) {
+                Toast.makeText(context, "Ошибка загрузки проекта", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            mediaPlayer?.release()
+            mediaPlayer = null
+        }
+    }
+
+    val currentFrame = frames.getOrElse(currentFrameIdx) { frames.first() }
+    if (activeLayerIdx >= currentFrame.layers.size) {
+        activeLayerIdx = (currentFrame.layers.size - 1).coerceAtLeast(0)
+    }
+    val activeLayer = currentFrame.layers.getOrNull(activeLayerIdx)
+
+    LaunchedEffect(isPlaying, isExporting, fps, frames.size) {
+        if (isPlaying && !isExporting && frames.isNotEmpty()) {
+            val mp = mediaPlayer
+            if (mp != null) {
+                val offsetMs = ((currentFrameIdx - audioStartFrame).coerceAtLeast(0) * 1000L) / fps.coerceIn(1, 60)
+                try {
+                    mp.seekTo(offsetMs.toInt().coerceAtMost(mp.duration.coerceAtLeast(0)))
+                    mp.start()
+                } catch (_: Exception) {}
+            }
+            while (isPlaying && !isExporting && frames.isNotEmpty()) {
+                delay(1000L / fps.coerceIn(1, 60))
+                currentFrameIdx = (currentFrameIdx + 1) % frames.size
+            }
+        } else {
+            try {
+                if (mediaPlayer?.isPlaying == true) mediaPlayer?.pause()
+            } catch (_: Exception) {}
+        }
+    }
+
+    val resolvedBoneOffsets: Map<Int, Float> = remember(frames.toList(), currentFrameIdx, tweenEnabled, bones.toList()) {
+        bones.associate { b ->
+            b.id to resolveBoneOffset(frames, currentFrameIdx, b.id, tweenEnabled)
+        }
+    }
+
+    val solvedBones: List<SolvedBoneNode> = remember(bones.toList(), skeletonOrigin, resolvedBoneOffsets) {
+        solveBoneHierarchy(bones, skeletonOrigin, resolvedBoneOffsets)
+    }
+
+    val currentCamera: CameraKey = remember(cameraKeys.toMap(), currentFrameIdx, tweenEnabled) {
+        resolveCameraKey(cameraKeys, currentFrameIdx, tweenEnabled)
+    }
+
+    val selectedBone = bones.find { it.id == selectedBoneId } ?: bones.firstOrNull()
+    val selectedBoneAngle = selectedBone?.let { resolvedBoneOffsets[it.id] ?: 0f } ?: 0f
+
+    val activeLayerTransform = remember(activeLayer, currentFrameIdx, tweenEnabled, frames.size) {
+        if (activeLayer == null) LayerTransformKey()
+        else resolveLayerTransform(activeLayer, currentFrameIdx, tweenEnabled)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121417))
+            .systemBarsPadding()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF1C1F26))
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("InkMotion", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+
+            LazyRow(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.weight(1f).padding(horizontal = 6.dp)
+            ) {
+                item { SmallChip("Калька", onionSkin) { onionSkin = !onionSkin } }
+                item { SmallChip("Кости", showBones) { showBones = !showBones } }
+                item { SmallChip("Кам.", showCameraGuide) { showCameraGuide = !showCameraGuide } }
+                item { SmallChip("Сетка", showGrid) { showGrid = !showGrid } }
+                item {
+                    SmallChip("Звук", audioUri != null) {
+                        audioPicker.launch("audio/*")
+                    }
+                }
+                item {
+                    SmallChip("Сохр.", false) {
+                        val json = exportProjectToJson(frames, bones, cameraKeys, skeletonOrigin, fps)
+                        val saved = saveTextProject(context, json, "InkMotion_proj_${System.currentTimeMillis()}")
+                        Toast.makeText(
+                            context,
+                            if (saved) "Проект сохранён (.json)" else "Ошибка сохранения",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                item {
+                    SmallChip("Откр.", false) {
+                        projectLoader.launch("*/*")
+                    }
+                }
+                item {
+                    SmallChip("${fps}FPS", false) {
+                        fps = when (fps) {
+                            8 -> 12
+                            12 -> 24
+                            else -> 8
+                        }
+                    }
+                }
+                item {
+                    SmallChip("PNG", false) {
+                        if (canvasSizePx.width > 0 && canvasSizePx.height > 0) {
+                            val bmp = renderFullFrame(
+                                width = canvasSizePx.width,
+                                height = canvasSizePx.height,
+                                frame = currentFrame,
+                                frameIndex = currentFrameIdx,
+                                solvedBones = solvedBones,
+                                camera = currentCamera,
+                                drawBonesOverlay = showBones,
+                                tweenEnabled = tweenEnabled
+                            )
+                            val ok = savePngToGallery(
+                                context,
+                                bmp,
+                                "InkMotion_f${currentFrameIdx + 1}_${System.currentTimeMillis()}"
+                            )
+                            Toast.makeText(
+                                context,
+                                if (ok) "PNG сохранён" else "Ошибка PNG",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+                item {
+                    SmallChip(if (isExporting) "..." else "MP4", false) {
+                        if (!isExporting && canvasSizePx.width > 0 && canvasSizePx.height > 0) {
+                            isExporting = true
+                            isPlaying = false
+                            scope.launch {
+                                val outFile = exportAnimationToMp4(
+                                    context = context,
+                                    frames = frames.toList(),
+                                    bones = bones.toList(),
+                                    cameraKeys = cameraKeys.toMap(),
+                                    rootOrigin = skeletonOrigin,
+                                    tweenEnabled = tweenEnabled,
+                                    fps = fps,
+                                    baseWidth = canvasSizePx.width,
+                                    baseHeight = canvasSizePx.height
+                                )
+                                isExporting = false
+                                Toast.makeText(
+                                    context,
+                                    if (outFile != null) "MP4 готов: ${outFile.name}" else "Ошибка MP4",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button(
+                onClick = { isPlaying = !isPlaying },
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 2.dp),
+                modifier = Modifier.height(32.dp)
+            ) {
+                Text(if (isPlaying) "Стоп" else "Пуск", fontSize = 11.sp)
+            }
+        }
+
+        if (audioName != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF19222B))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "♪ $audioName (старт: кадр ${audioStartFrame + 1})",
+                    color = Color(0xFF72EFDD),
+                    fontSize = 11.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                SmallChip("Старт тут", false) {
+                    audioStartFrame = currentFrameIdx
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+                SmallChip("Убрать", false) {
+                    mediaPlayer?.release()
+                    mediaPlayer = null
+                    audioUri = null
+                    audioName = null
+                }
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF171A21))
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                item { ToolBadge("Кисть", tool == StudioTool.BRUSH) { tool = StudioTool.BRUSH } }
+                item { ToolBadge("Ластик", tool == StudioTool.ERASER) { tool = StudioTool.ERASER } }
+                item { ToolBadge("Заливка", tool == StudioTool.FILL) { tool = StudioTool.FILL } }
+                item { ToolBadge("Линия", tool == StudioTool.LINE) { tool = StudioTool.LINE } }
+                item { ToolBadge("Прям.", tool == StudioTool.RECT) { tool = StudioTool.RECT } }
+                item { ToolBadge("Овал", tool == StudioTool.OVAL) { tool = StudioTool.OVAL } }
+                item {
+                    ToolBadge("Кости", tool == StudioTool.BONE_RIG) {
+                        tool = StudioTool.BONE_RIG
+                        showBones = true
+                    }
+                }
+                item { ToolBadge("Трансф.", tool == StudioTool.TRANSFORM) { tool = StudioTool.TRANSFORM } }
+                item {
+                    ToolBadge("Камера", tool == StudioTool.CAMERA) {
+                        tool = StudioTool.CAMERA
+                        showCameraGuide = true
+                    }
+                }
+                item {
+                    ToolBadge("Слои (${currentFrame.layers.size})", showLayersDrawer) {
+                        showLayersDrawer = !showLayersDrawer
+                    }
+                }
+                item {
+                    ToolBadge("Отзерк. X", false) {
+                        if (activeLayer != null && canvasSizePx.width > 0) {
+                            mirrorLayerHorizontal(activeLayer, canvasSizePx.width.toFloat())
+                        }
+                    }
+                }
+                item {
+                    ToolBadge("Очистить", false) {
+                        if (activeLayer != null) {
+                   
